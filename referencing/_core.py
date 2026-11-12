@@ -379,15 +379,14 @@ class Registry(Mapping[URI, Resource[D]]):
         if isinstance(new, Resource):
             new = (new,)
 
-        resources = self._resources
-        uncrawled = self._uncrawled
-        for resource in new:
-            id = resource.id()
-            if id is None:
-                raise exceptions.NoInternalID(resource=resource)
-            uncrawled = uncrawled.insert(id)
-            resources = resources.insert(id, resource)
-        return evolve(self, resources=resources, uncrawled=uncrawled)
+        def pairs():
+            for resource in new:
+                id = resource.id()
+                if id is None:
+                    raise exceptions.NoInternalID(resource=resource)
+                yield id, resource
+
+        return self.with_resources(pairs())
 
     def __repr__(self) -> str:
         size = len(self)
@@ -521,13 +520,41 @@ class Registry(Mapping[URI, Resource[D]]):
         """
         resources = self._resources
         uncrawled = self._uncrawled
+        replaced: dict[URI, Resource[D]] = {}
         for uri, resource in pairs:
             # Empty fragment URIs are equivalent to URIs without the fragment.
             # TODO: Is this true for non JSON Schema resources? Probably not.
             uri = uri.rstrip("#")
+            if uri in resources and resources[uri] is not resource:
+                replaced.setdefault(uri, resources[uri])
             uncrawled = uncrawled.insert(uri)
             resources = resources.insert(uri, resource)
-        return evolve(self, resources=resources, uncrawled=uncrawled)
+        anchors = self._anchors
+        if replaced:
+            anchors = self._discard_replaced_anchors(anchors, replaced)
+        return evolve(
+            self,
+            resources=resources,
+            anchors=anchors,
+            uncrawled=uncrawled,
+        )
+
+    def _discard_replaced_anchors(
+        self,
+        anchors: HashTrieMap[tuple[URI, str], AnchorType[D]],
+        replaced: Mapping[URI, Resource[D]],
+    ) -> HashTrieMap[tuple[URI, str], AnchorType[D]]:
+        for uri, resource in replaced.items():
+            pending = [(resource, True)]
+            while pending:
+                old, is_root = pending.pop()
+                id = old.id()
+                if not is_root and id is not None and urljoin(uri, id) != uri:
+                    continue
+                for anchor in old.anchors():
+                    anchors = anchors.discard((uri, anchor.name))
+                pending.extend((child, False) for child in old.subresources())
+        return anchors
 
     def with_contents(
         self,
@@ -549,12 +576,19 @@ class Registry(Mapping[URI, Resource[D]]):
         if registries == (self,):
             return self
         resources = self._resources
-        anchors = self._anchors
+        anchors: HashTrieMap[tuple[URI, str], AnchorType[D]] = self._anchors
         uncrawled = self._uncrawled
         retrieve = self._retrieve
         for registry in registries:
+            replaced = {
+                uri: resources[uri]
+                for uri, resource in registry._resources.items()
+                if uri in resources and resources[uri] is not resource
+            }
+            if replaced:
+                anchors = self._discard_replaced_anchors(anchors, replaced)
             resources = resources.update(registry._resources)
-            anchors = anchors.update(registry._anchors)
+            anchors = anchors.update(registry._anchors.items())
             uncrawled = uncrawled.update(registry._uncrawled)
 
             if registry._retrieve is not _fail_to_retrieve:
